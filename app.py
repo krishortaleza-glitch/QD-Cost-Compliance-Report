@@ -36,7 +36,7 @@ def prepare_data(cost_df, invoice_df, promotion_df, vendor_df):
 
     cost_df["ProductUID"] = clean_id(cost_df["retailProductUID"])
     cost_df["VendorUID"] = clean_id(cost_df["vendorProductUID"])
-    cost_df["StoreID"] = clean_id(cost_df["Store"])
+    cost_df["StoreID"] = clean_id(cost_df["StoreID"])
 
     # Invoice File
 
