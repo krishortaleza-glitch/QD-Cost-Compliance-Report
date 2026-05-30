@@ -3,13 +3,14 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(
-    page_title="QD Compliance Checker",
+    page_title="QD Cost Compliance Report",
     layout="wide"
 )
 
-# =====================================================
+
+# ==================================================
 # HELPERS
-# =====================================================
+# ==================================================
 
 def clean_id(series):
     return (
@@ -21,40 +22,20 @@ def clean_id(series):
 
 
 @st.cache_data
-def load_csv(uploaded_file):
-    return pd.read_csv(uploaded_file)
+def load_csv(file):
+    return pd.read_csv(file)
 
 
-def prepare_data(cost_df, invoice_df, promotion_df, vendor_df):
+def prepare_data(cost_df, invoice_df):
 
     cost_df = cost_df.copy()
     invoice_df = invoice_df.copy()
-    promotion_df = promotion_df.copy()
-    vendor_df = vendor_df.copy()
 
-    # Cost File
-
-    cost_df["ProductUID"] = clean_id(cost_df["retailProductUID"])
-    cost_df["VendorUID"] = clean_id(cost_df["vendorProductUID"])
     cost_df["StoreID"] = clean_id(cost_df["StoreID"])
+    cost_df["ProductUID"] = clean_id(cost_df["retailProductUID"])
 
-    # Invoice File
-
-    invoice_df["ProductUID"] = clean_id(invoice_df["productId"])
     invoice_df["StoreID"] = clean_id(invoice_df["store"])
-    invoice_df["Alias"] = clean_id(invoice_df["alias"])
-
-    # Promotion File
-
-    promotion_df["ProductUID"] = clean_id(promotion_df["ProductUID"])
-    promotion_df["VendorUID"] = clean_id(promotion_df["VendorUID"])
-
-    # Vendor File
-
-    vendor_df["StoreID"] = clean_id(vendor_df["store"])
-    vendor_df["Alias"] = clean_id(vendor_df["vendorAlias"])
-
-    # Dates
+    invoice_df["ProductUID"] = clean_id(invoice_df["productId"])
 
     cost_df["date"] = pd.to_datetime(
         cost_df["date"],
@@ -71,162 +52,85 @@ def prepare_data(cost_df, invoice_df, promotion_df, vendor_df):
         errors="coerce"
     )
 
-    return cost_df, invoice_df, promotion_df, vendor_df
+    return cost_df, invoice_df
 
 
-def build_compliance_report(
-    cost_df,
-    invoice_df,
-    promotion_df,
-    vendor_df
-):
+# ==================================================
+# COMPLIANCE ENGINE
+# ==================================================
 
-    # ==========================================
-    # Attach Vendor Name to Invoice
-    # ==========================================
-
-    invoice_df = invoice_df.merge(
-        vendor_df[
-            [
-                "StoreID",
-                "Alias",
-                "vendorName"
-            ]
-        ].drop_duplicates(),
-        on=[
-            "StoreID",
-            "Alias"
-        ],
-        how="left"
-    )
-
-    # ==========================================
-    # Product + VendorName -> VendorUID
-    # ==========================================
-
-    vendor_lookup = (
-        cost_df[
-            [
-                "ProductUID",
-                "vendorName",
-                "VendorUID"
-            ]
-        ]
-        .drop_duplicates()
-    )
-
-    invoice_df = invoice_df.merge(
-        vendor_lookup,
-        on=[
-            "ProductUID",
-            "vendorName"
-        ],
-        how="left"
-    )
-
-    # ==========================================
-    # Product + VendorUID -> MixMatchID
-    # ==========================================
-
-    promo_lookup = (
-        promotion_df[
-            [
-                "ProductUID",
-                "VendorUID",
-                "MixMatchID"
-            ]
-        ]
-        .drop_duplicates()
-    )
-
-    invoice_df = invoice_df.merge(
-        promo_lookup,
-        on=[
-            "ProductUID",
-            "VendorUID"
-        ],
-        how="left"
-    )
-
-    cost_df = cost_df.merge(
-        promo_lookup,
-        on=[
-            "ProductUID",
-            "VendorUID"
-        ],
-        how="left"
-    )
-
-    # ==========================================
-    # Compliance Calculation
-    # ==========================================
+def build_compliance_report(cost_df, invoice_df):
 
     results = []
 
-    for _, qd in cost_df.iterrows():
+    for _, row in cost_df.iterrows():
 
-        store = qd["StoreID"]
-        mixmatch = qd["MixMatchID"]
+        store = row["StoreID"]
+        product = row["ProductUID"]
 
-        start_date = qd["date"]
-        end_date = qd["endDate"]
+        expected_cost = row["caseCost"]
 
-        req_qty = qd["caseQuantity"]
-        req_cost = qd["caseCost"]
+        start_date = row["date"]
+        end_date = row["endDate"]
 
         invoices = invoice_df[
             (invoice_df["StoreID"] == store)
             &
-            (invoice_df["MixMatchID"] == mixmatch)
+            (invoice_df["ProductUID"] == product)
             &
             (invoice_df["date"] >= start_date)
             &
             (invoice_df["date"] <= end_date)
         ]
 
-        actual_qty = invoices["quantity"].sum()
-
         if len(invoices) == 0:
 
-            status = "No Purchases"
+            status = "NO INVOICE"
+
             lowest_cost = np.nan
+            variance = np.nan
+            total_qty = 0
+            overage = 0
 
         else:
 
             lowest_cost = invoices["price"].min()
 
-            qty_pass = actual_qty >= req_qty
+            variance = (
+                lowest_cost
+                - expected_cost
+            )
 
-            cost_pass = (
-                invoices["price"] >= req_cost
-            ).all()
+            total_qty = invoices["quantity"].sum()
 
-            if qty_pass and cost_pass:
-                status = "Compliant"
+            overage = (
+                (
+                    invoices["price"]
+                    - expected_cost
+                )
+                * invoices["quantity"]
+            ).sum()
 
-            elif not qty_pass and cost_pass:
-                status = "Qty Fail"
-
-            elif qty_pass and not cost_pass:
-                status = "Cost Fail"
-
-            else:
-                status = "Qty & Cost Fail"
+            status = (
+                "PASS"
+                if lowest_cost >= expected_cost
+                else "FAIL"
+            )
 
         results.append(
             {
                 "StoreID": store,
-                "Vendor": qd["vendorName"],
-                "ProductUID": qd["ProductUID"],
-                "ProductName": qd.get(
-                    "retailProductName",
-                    ""
-                ),
-                "MixMatchID": mixmatch,
-                "RequiredQty": req_qty,
-                "ActualQty": actual_qty,
-                "RequiredCost": req_cost,
-                "LowestCost": lowest_cost,
+                "Vendor": row["vendorName"],
+                "ProductUID": product,
+                "ProductName": row["retailProductName"],
+                "ProductType": row["category"],
+                "Family": row["family"],
+                "PackageGroup": row["group"],
+                "ExpectedCost": expected_cost,
+                "LowestActualCost": lowest_cost,
+                "Variance": variance,
+                "TotalCases": total_qty,
+                "OverageDollars": round(overage, 2),
                 "Status": status,
                 "StartDate": start_date,
                 "EndDate": end_date
@@ -236,14 +140,14 @@ def build_compliance_report(
     return pd.DataFrame(results)
 
 
-# =====================================================
+# ==================================================
 # UI
-# =====================================================
+# ==================================================
 
-st.title("QD Compliance Checker")
+st.title("QD Cost Compliance Report")
 
 st.markdown(
-    "Upload all four files to generate the compliance report."
+    "Upload the QD Cost File and Invoice File."
 )
 
 cost_file = st.file_uploader(
@@ -256,47 +160,22 @@ invoice_file = st.file_uploader(
     type=["csv"]
 )
 
-promotion_file = st.file_uploader(
-    "Promotion File",
-    type=["csv"]
-)
+if cost_file and invoice_file:
 
-vendor_file = st.file_uploader(
-    "Vendor Mapping File",
-    type=["csv"]
-)
-
-if (
-    cost_file
-    and invoice_file
-    and promotion_file
-    and vendor_file
-):
-
-    with st.spinner("Loading files..."):
+    with st.spinner("Processing..."):
 
         cost_df = load_csv(cost_file)
         invoice_df = load_csv(invoice_file)
-        promotion_df = load_csv(promotion_file)
-        vendor_df = load_csv(vendor_file)
 
-        cost_df, invoice_df, promotion_df, vendor_df = (
-            prepare_data(
-                cost_df,
-                invoice_df,
-                promotion_df,
-                vendor_df
-            )
+        cost_df, invoice_df = prepare_data(
+            cost_df,
+            invoice_df
         )
 
         compliance_df = build_compliance_report(
             cost_df,
-            invoice_df,
-            promotion_df,
-            vendor_df
+            invoice_df
         )
-
-    st.success("Compliance Report Generated")
 
     # =====================================
     # KPIs
@@ -304,74 +183,122 @@ if (
 
     total = len(compliance_df)
 
-    compliant = (
+    passed = (
         compliance_df["Status"]
-        == "Compliant"
+        == "PASS"
     ).sum()
 
-    pct = round(
-        (compliant / total) * 100,
-        2
-    ) if total else 0
+    failed = (
+        compliance_df["Status"]
+        == "FAIL"
+    ).sum()
 
-    c1, c2, c3 = st.columns(3)
+    no_invoice = (
+        compliance_df["Status"]
+        == "NO INVOICE"
+    ).sum()
+
+    compliance_pct = round(
+        (
+            passed /
+            (passed + failed)
+        ) * 100,
+        2
+    ) if (passed + failed) else 0
+
+    total_overage = round(
+        compliance_df["OverageDollars"].sum(),
+        2
+    )
+
+    total_cases = int(
+        compliance_df["TotalCases"].sum()
+    )
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
-        "Total QD Rows",
+        "Products",
         total
     )
 
     c2.metric(
-        "Compliant",
-        compliant
+        "Pass",
+        passed
     )
 
     c3.metric(
+        "Fail",
+        failed
+    )
+
+    c4.metric(
+        "No Invoice",
+        no_invoice
+    )
+
+    c5.metric(
         "Compliance %",
-        f"{pct}%"
+        f"{compliance_pct}%"
+    )
+
+    c6.metric(
+        "Overage $",
+        f"${total_overage:,.2f}"
+    )
+
+    st.metric(
+        "Total Cases",
+        f"{total_cases:,}"
     )
 
     # =====================================
-    # Status Breakdown
+    # TABS
     # =====================================
 
-    st.subheader("Status Breakdown")
-
-    st.dataframe(
-        compliance_df["Status"]
-        .value_counts()
-        .reset_index()
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "Failures",
+            "Pass",
+            "All Results"
+        ]
     )
 
+    with tab1:
+
+        failures = compliance_df[
+            compliance_df["Status"]
+            == "FAIL"
+        ]
+
+        st.dataframe(
+            failures.sort_values(
+                "Variance"
+            ),
+            use_container_width=True
+        )
+
+    with tab2:
+
+        passed_df = compliance_df[
+            compliance_df["Status"]
+            == "PASS"
+        ]
+
+        st.dataframe(
+            passed_df,
+            use_container_width=True
+        )
+
+    with tab3:
+
+        st.dataframe(
+            compliance_df,
+            use_container_width=True
+        )
+
     # =====================================
-    # Failures
-    # =====================================
-
-    st.subheader("Failures")
-
-    failures = compliance_df[
-        compliance_df["Status"]
-        != "Compliant"
-    ]
-
-    st.dataframe(
-        failures,
-        use_container_width=True
-    )
-
-    # =====================================
-    # Full Results
-    # =====================================
-
-    st.subheader("Full Results")
-
-    st.dataframe(
-        compliance_df,
-        use_container_width=True
-    )
-
-    # =====================================
-    # Download
+    # DOWNLOAD
     # =====================================
 
     csv = compliance_df.to_csv(
@@ -381,6 +308,6 @@ if (
     st.download_button(
         "Download Results",
         csv,
-        "qd_compliance_report.csv",
+        "qd_cost_compliance_report.csv",
         "text/csv"
     )
